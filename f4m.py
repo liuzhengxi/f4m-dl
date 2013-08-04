@@ -6,6 +6,7 @@ from struct import unpack, pack
 import sys
 import io
 import os
+import time
 
 import youtube_dl
 from youtube_dl.utils import *
@@ -148,10 +149,17 @@ class FlvReader(io.BytesIO):
         assert box_type == b'abst'
         return FlvReader(box_data).read_abst()
 
+def read_bootstrap_info(bootstrap_bytes):
+    return FlvReader(bootstrap_bytes).read_bootstrap_info()
+
 
 def _add_ns(prop):
     return '{http://ns.adobe.com/f4m/1.0}%s' % prop
 
+
+class ReallyQuietDownloader(youtube_dl.FileDownloader):
+    def to_screen(sef, *args, **kargs):
+        pass
 
 class F4MDownloader(youtube_dl.FileDownloader):
     """
@@ -181,11 +189,13 @@ class F4MDownloader(youtube_dl.FileDownloader):
         stream.write(b'\x00\x00\x01\x73')
 
     def download_info_dict(self, filename, info_dict):
+        self.report_warning(u'The F4M downloader is a work in progress.')
+
         man_url = info_dict['url']
         self.to_screen(u'Downloading f4m manifest', True)
         manifest = compat_urllib_request.urlopen(man_url).read()
         self.report_destination(filename)
-        dl = youtube_dl.FileDownloader(self.ydl, {'continuedl': True})
+        dl = ReallyQuietDownloader(self.ydl, {'continuedl': True, 'quiet': True, 'noprogress':True})
 
         doc = etree.fromstring(manifest)
         formats = [(int(f.attrib.get('bitrate', -1)),f) for f in doc.findall(_add_ns('media'))]
@@ -194,17 +204,41 @@ class F4MDownloader(youtube_dl.FileDownloader):
         base_url = compat_urlparse.urljoin(man_url,media.attrib['url'])
         bootstrap = base64.b64decode(doc.find(_add_ns('bootstrapInfo')).text)
         metadata = base64.b64decode(media.find(_add_ns('metadata')).text)
-        boot_info = FlvReader(bootstrap).read_bootstrap_info()
+        boot_info = read_bootstrap_info(bootstrap)
 
         tmpfilename = self.temp_name(filename)
         (dest_stream, tmpfilename) = sanitize_open(tmpfilename, 'wb')
         self._write_flv_header(dest_stream, metadata)
 
-        self.to_screen(u'Downloading %d segments' % len(boot_info['segments']), True)
+        self.downloaded_bytes = 0
+        self.bytes_in_disk = 0
+        self.frag_counter = 0
+        start = time.time()
+        total_frags = 0
+        for seg_i, seg in enumerate(boot_info['segments'],1):
+            total_frags += seg['segment_run'][0][1]
+        def frag_progress_hook(status):
+            frag_bytes = status.get('total_bytes',0)
+            estimated_size = frag_bytes * total_frags
+            data_len_str = self.format_bytes(estimated_size)
+            if status['status'] == u'finished':
+                self.downloaded_bytes += frag_bytes
+                byte_counter = self.downloaded_bytes
+                self.frag_counter += 1
+                percent_str = self.calc_percent(self.frag_counter, total_frags)
+            else:
+                byte_counter = self.downloaded_bytes + status.get('downloaded_bytes', 0)
+                percent_str = self.calc_percent(byte_counter, estimated_size)
+            speed_str = self.calc_speed(start, time.time(), byte_counter)
+            eta_str = self.calc_eta(start, time.time(), estimated_size, byte_counter)
+            self.report_progress(percent_str, data_len_str, speed_str, eta_str)
+        dl.add_progress_hook(frag_progress_hook)
+
         frags_filenames = []
+        self.to_screen(u'Downloading %d segments' % len(boot_info['segments']), True)
         for seg_i, seg in enumerate(boot_info['segments'],1):
             n_frags = seg['segment_run'][0][1]
-            self.to_screen(u'Downloading %d fragments' % n_frags, True)
+            self.to_screen(u'Segment #%d: Downloading %d fragments' % (seg_i, n_frags), True)
             for frag_i in range(1, n_frags+1):
                 name = u'Seg%d-Frag%d' % (seg_i, frag_i)
                 url = base_url + name
@@ -234,9 +268,21 @@ class F4MDownloader(youtube_dl.FileDownloader):
                             # break
                 frags_filenames.append(frag_filename)
 
+        self.report_finish()
+
         self.try_rename(tmpfilename, filename)
         for frag_file in frags_filenames:
             os.remove(frag_file)
+
+        fsize = os.path.getsize(encodeFilename(filename))
+        self._hook_progress({
+                'downloaded_bytes': fsize,
+                'total_bytes': fsize,
+                'filename': filename,
+                'status': 'finished',
+            })
+        del self.downloaded_bytes
+        del self.frag_counter
 
 if __name__ == '__main__':
     ydl = youtube_dl.YoutubeDL({'outtmpl': ''})
