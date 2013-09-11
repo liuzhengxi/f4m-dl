@@ -7,6 +7,7 @@ import sys
 import io
 import os
 import time
+import itertools
 
 import youtube_dl
 from youtube_dl.utils import *
@@ -94,6 +95,7 @@ class FlvReader(io.BytesIO):
         return {'version': version,
                 'time_scale': time_scale,
                 'fragments': fragments,
+                'quality_entries': quality_entries,
                 }
 
     def read_abst(self, debug=False):
@@ -136,6 +138,7 @@ class FlvReader(io.BytesIO):
         return {'segments': segments,
                 'movie_identifier': movie_identifier,
                 'drm_data': drm_data,
+                'fragments': fragments,
                 }
 
     def read_bootstrap_info(self):
@@ -151,6 +154,20 @@ class FlvReader(io.BytesIO):
 
 def read_bootstrap_info(bootstrap_bytes):
     return FlvReader(bootstrap_bytes).read_bootstrap_info()
+
+def build_fragments_list(boot_info):
+    """ Return a list of (segment, fragment) for each fragment in the video """
+    res = []
+    segment_run_table = boot_info['segments'][0]
+    # I've only found videos with one segment
+    segment_run_entry = segment_run_table['segment_run'][0]
+    n_frags = segment_run_entry[1]
+    fragment_run_entry_table = boot_info['fragments'][0]['fragments']
+    frag_entry_index = 0
+    first_frag_number = fragment_run_entry_table[0]['first']
+    for (i, frag_number) in zip(range(1, n_frags+1), itertools.count(first_frag_number)):
+        res.append((1, frag_number))
+    return res
 
 
 def _add_ns(prop):
@@ -205,6 +222,9 @@ class F4MDownloader(youtube_dl.FileDownloader):
         bootstrap = base64.b64decode(doc.find(_add_ns('bootstrapInfo')).text)
         metadata = base64.b64decode(media.find(_add_ns('metadata')).text)
         boot_info = read_bootstrap_info(bootstrap)
+        fragments_list = build_fragments_list(boot_info)
+        total_frags = len(fragments_list)
+
 
         tmpfilename = self.temp_name(filename)
         (dest_stream, tmpfilename) = sanitize_open(tmpfilename, 'wb')
@@ -214,9 +234,6 @@ class F4MDownloader(youtube_dl.FileDownloader):
         self.bytes_in_disk = 0
         self.frag_counter = 0
         start = time.time()
-        total_frags = 0
-        for seg_i, seg in enumerate(boot_info['segments'],1):
-            total_frags += seg['segment_run'][0][1]
         def frag_progress_hook(status):
             frag_bytes = status.get('total_bytes',0)
             estimated_size = frag_bytes * total_frags
@@ -235,38 +252,35 @@ class F4MDownloader(youtube_dl.FileDownloader):
         dl.add_progress_hook(frag_progress_hook)
 
         frags_filenames = []
-        self.to_screen(u'Downloading %d segments' % len(boot_info['segments']), True)
-        for seg_i, seg in enumerate(boot_info['segments'],1):
-            n_frags = seg['segment_run'][0][1]
-            self.to_screen(u'Segment #%d: Downloading %d fragments' % (seg_i, n_frags), True)
-            for frag_i in range(1, n_frags+1):
-                name = u'Seg%d-Frag%d' % (seg_i, frag_i)
-                url = base_url + name
-                frag_filename = u'%s-%s' % (tmpfilename, name)
-                success = dl._do_download(frag_filename, {'url': url})
-                if not success:
-                    return False
-                with open(frag_filename, 'rb') as down:
-                    down_data = down.read()
-                    reader = FlvReader(down_data)
-                    while True:
-                        _, box_type, box_data = reader.read_box_info()
-                        if box_type == b'mdat':
-                            dest_stream.write(box_data)
-                            break
-                            # Using the following code may fix some videos, but 
-                            # only in mplayer, VLC won't play the sound.
-                            # mdat_reader = FlvReader(box_data)
-                            # media_type = mdat_reader.read_unsigned_char()
-                            # while True:
-                            #     if mdat_reader.read_unsigned_char() == media_type:
-                            #         if mdat_reader.read_unsigned_char() == 0x00:
-                            #             break
-                            # dest_stream.write(pack('!B', media_type))
-                            # dest_stream.write(b'\x00')
-                            # dest_stream.write(mdat_reader.read())
-                            # break
-                frags_filenames.append(frag_filename)
+        for (seg_i, frag_i) in fragments_list:
+            name = u'Seg%d-Frag%d' % (seg_i, frag_i)
+            url = base_url + name
+            print(url)
+            frag_filename = u'%s-%s' % (tmpfilename, name)
+            success = dl._do_download(frag_filename, {'url': url})
+            if not success:
+                return False
+            with open(frag_filename, 'rb') as down:
+                down_data = down.read()
+                reader = FlvReader(down_data)
+                while True:
+                    _, box_type, box_data = reader.read_box_info()
+                    if box_type == b'mdat':
+                        dest_stream.write(box_data)
+                        break
+                        # Using the following code may fix some videos, but 
+                        # only in mplayer, VLC won't play the sound.
+                        # mdat_reader = FlvReader(box_data)
+                        # media_type = mdat_reader.read_unsigned_char()
+                        # while True:
+                        #     if mdat_reader.read_unsigned_char() == media_type:
+                        #         if mdat_reader.read_unsigned_char() == 0x00:
+                        #             break
+                        # dest_stream.write(pack('!B', media_type))
+                        # dest_stream.write(b'\x00')
+                        # dest_stream.write(mdat_reader.read())
+                        # break
+            frags_filenames.append(frag_filename)
 
         self.report_finish(self.downloaded_bytes, time.time() - start)
 
