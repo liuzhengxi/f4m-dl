@@ -249,7 +249,7 @@ class F4MDownloader(youtube_dl.FileDownloader):
                 with open(frag_filename, 'rb') as down:
                     down_data = down.read()
                     reader = FlvReader(down_data)
-                    for i in range(10):
+                    while True:
                         _, box_type, box_data = reader.read_box_info()
                         if box_type == b'mdat':
                             dest_stream.write(box_data)
