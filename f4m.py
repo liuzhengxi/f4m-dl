@@ -268,7 +268,7 @@ class F4MDownloader(youtube_dl.FileDownloader):
                             # break
                 frags_filenames.append(frag_filename)
 
-        self.report_finish()
+        self.report_finish(self.downloaded_bytes, time.time() - start)
 
         self.try_rename(tmpfilename, filename)
         for frag_file in frags_filenames:
